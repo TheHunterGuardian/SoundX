@@ -18,9 +18,9 @@ module.exports = {
   nodes: [
      {
       name: "GlaceYT",
-      password: "glaceyt",
-      host: "193.226.78.187",
-      port:  9372,
+      password: "WnyZBlw9ohN",
+      host: "78.46.65.243",
+      port:  3794,
       secure: false
     }
   ]
