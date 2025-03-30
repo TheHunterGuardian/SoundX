@@ -5,12 +5,10 @@ const SpotifyWebApi = require('spotify-web-api-node');
 const { getData } = require('spotify-url-info')(require('node-fetch'));
 const requesters = new Map();
 
-
 const spotifyApi = new SpotifyWebApi({
-    clientId: config.spotifyClientId, 
+    clientId: config.spotifyClientId,
     clientSecret: config.spotifyClientSecret,
 });
-
 
 async function getSpotifyPlaylistTracks(playlistId) {
     try {
@@ -19,7 +17,7 @@ async function getSpotifyPlaylistTracks(playlistId) {
 
         let tracks = [];
         let offset = 0;
-        let limit = 100;
+        const limit = 100;
         let total = 0;
 
         do {
@@ -33,7 +31,7 @@ async function getSpotifyPlaylistTracks(playlistId) {
                     tracks.push(trackName);
                 }
             }
-        } while (tracks.length < total);
+        } while (tracks.length < total && offset < 1000); // Safety limit
 
         return tracks;
     } catch (error) {
@@ -46,35 +44,43 @@ async function play(client, interaction, lang) {
     try {
         const query = interaction.options.getString('name');
 
+        // Voice channel check
         if (!interaction.member.voice.channelId) {
-            const embed = new EmbedBuilder()
-                .setColor('#ff0000')
-                .setAuthor({
-                    name: lang.play.embed.error,
-                    iconURL: musicIcons.alertIcon,
-                    url: config.SupportServer
-                })
-                .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon })
-                .setDescription(lang.play.embed.noVoiceChannel);
-
-            await interaction.reply({ embeds: [embed], ephemeral: true });
-            return;
+            return interaction.reply({
+                embeds: [
+                    new EmbedBuilder()
+                        .setColor('#ff0000')
+                        .setAuthor({
+                            name: lang.play.embed.error,
+                            iconURL: musicIcons.alertIcon,
+                            url: config.SupportServer
+                        })
+                        .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon })
+                        .setDescription(lang.play.embed.noVoiceChannel)
+                ],
+                ephemeral: true
+            });
         }
 
+        // Lavalink node check
         if (!client.riffy.nodes || client.riffy.nodes.size === 0) {
-            const embed = new EmbedBuilder()
-                .setColor('#ff0000')
-                .setAuthor({
-                    name: lang.play.embed.error,
-                    iconURL: musicIcons.alertIcon,
-                    url: config.SupportServer
-                })
-                .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon })
-                .setDescription(lang.play.embed.noLavalinkNodes);
-
-            await interaction.reply({ embeds: [embed], ephemeral: true });
-            return;
+            return interaction.reply({
+                embeds: [
+                    new EmbedBuilder()
+                        .setColor('#ff0000')
+                        .setAuthor({
+                            name: lang.play.embed.error,
+                            iconURL: musicIcons.alertIcon,
+                            url: config.SupportServer
+                        })
+                        .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon })
+                        .setDescription(lang.play.embed.noLavalinkNodes)
+                ],
+                ephemeral: true
+            });
         }
+
+        await interaction.deferReply();
 
         const player = client.riffy.createConnection({
             guildId: interaction.guildId,
@@ -83,100 +89,142 @@ async function play(client, interaction, lang) {
             deaf: true
         });
 
-        await interaction.deferReply();
-
-        let tracksToQueue = [];
-        let isPlaylist = false;
-
+        // Spotify handling
         if (query.includes('spotify.com')) {
             try {
                 const spotifyData = await getData(query);
+                let tracksToQueue = [];
 
                 if (spotifyData.type === 'track') {
-                    const trackName = `${spotifyData.name} - ${spotifyData.artists.map(a => a.name).join(', ')}`;
-                    tracksToQueue.push(trackName);
+                    tracksToQueue.push(`${spotifyData.name} - ${spotifyData.artists.map(a => a.name).join(', ')}`);
                 } else if (spotifyData.type === 'playlist') {
-                    isPlaylist = true;
-                    const playlistId = query.split('/playlist/')[1].split('?')[0]; 
+                    const playlistId = query.split('/playlist/')[1].split('?')[0];
                     tracksToQueue = await getSpotifyPlaylistTracks(playlistId);
                 }
+
+                let queuedCount = 0;
+                for (const trackQuery of tracksToQueue) {
+                    const resolve = await client.riffy.resolve({ query: trackQuery, requester: interaction.user });
+                    if (resolve && resolve.tracks && resolve.tracks.length > 0) {
+                        const track = resolve.tracks[0];
+                        track.info.requester = interaction.user;
+                        player.queue.add(track);
+                        requesters.set(track.info.uri, interaction.user.username);
+                        queuedCount++;
+                    }
+                }
+
+                if (queuedCount === 0) {
+                    throw new Error('No tracks found from Spotify');
+                }
+
+                if (!player.playing && !player.paused) player.play();
+
+                return interaction.followUp({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(config.embedColor)
+                            .setAuthor({
+                                name: lang.play.embed.requestUpdated,
+                                iconURL: musicIcons.beats2Icon,
+                                url: config.SupportServer
+                            })
+                            .setDescription(`Queued ${queuedCount} tracks from Spotify`)
+                            .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon })
+                    ]
+                });
             } catch (err) {
-                console.error('Error fetching Spotify data:', err);
-                await interaction.followUp({ content: "❌ Failed to fetch Spotify data." });
-                return;
+                console.error('Spotify error:', err);
+                return interaction.followUp({
+                    content: "❌ Failed to process Spotify link. Please try a different source."
+                });
             }
-        } else {
-            
-            const resolve = await client.riffy.resolve({ query, requester: interaction.user.username });
+        }
 
-            if (!resolve || typeof resolve !== 'object' || !Array.isArray(resolve.tracks)) {
-                throw new TypeError('Invalid response from Riffy');
+        // Regular query handling
+        try {
+            const resolve = await client.riffy.resolve({ query, requester: interaction.user });
+
+            // Validate response structure
+            if (!resolve || !resolve.tracks || !Array.isArray(resolve.tracks)) {
+                throw new Error('Invalid response from Lavalink');
             }
 
-            if (resolve.loadType === 'playlist') {
-                isPlaylist = true;
+            if (resolve.loadType === 'NO_MATCHES' || resolve.loadType === 'LOAD_FAILED') {
+                return interaction.followUp({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(config.embedColor)
+                            .setAuthor({
+                                name: lang.play.embed.error,
+                                iconURL: musicIcons.alertIcon,
+                                url: config.SupportServer
+                            })
+                            .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon })
+                            .setDescription(lang.play.embed.noResults)
+                    ]
+                });
+            }
+
+            // Handle different load types
+            if (resolve.loadType === 'PLAYLIST_LOADED') {
                 for (const track of resolve.tracks) {
-                    track.info.requester = interaction.user.username;
+                    track.info.requester = interaction.user;
                     player.queue.add(track);
                     requesters.set(track.info.uri, interaction.user.username);
                 }
-            } else if (resolve.loadType === 'search' || resolve.loadType === 'track') {
-                const track = resolve.tracks.shift();
-                track.info.requester = interaction.user.username;
+
+                if (!player.playing && !player.paused) player.play();
+
+                return interaction.followUp({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(config.embedColor)
+                            .setAuthor({
+                                name: lang.play.embed.requestUpdated,
+                                iconURL: musicIcons.beats2Icon,
+                                url: config.SupportServer
+                            })
+                            .setDescription(`Added ${resolve.tracks.length} tracks from playlist`)
+                            .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon })
+                    ]
+                });
+            }
+
+            // Single track handling
+            if (resolve.tracks.length > 0) {
+                const track = resolve.tracks[0];
+                track.info.requester = interaction.user;
                 player.queue.add(track);
                 requesters.set(track.info.uri, interaction.user.username);
-            } else {
-                const errorEmbed = new EmbedBuilder()
-                .setColor(config.embedColor)
-                .setAuthor({ 
-                    name: lang.play.embed.error,
-                    iconURL: musicIcons.alertIcon,
-                    url: config.SupportServer
-                })
-                .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon })
-                .setDescription(lang.play.embed.noResults);
 
-            await interaction.followUp({ embeds: [errorEmbed] });
-                return;
+                if (!player.playing && !player.paused) player.play();
+
+                return interaction.followUp({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(config.embedColor)
+                            .setAuthor({
+                                name: lang.play.embed.requestUpdated,
+                                iconURL: musicIcons.beats2Icon,
+                                url: config.SupportServer
+                            })
+                            .setDescription(`Now playing: [${track.info.title}](${track.info.uri})`)
+                            .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon })
+                    ]
+                });
             }
+        } catch (err) {
+            console.error('Lavalink error:', err);
+            return interaction.followUp({
+                content: "❌ Failed to process your request. Please try a different query."
+            });
         }
-
-        let queuedTracks = 0;
-
-       
-        for (const trackQuery of tracksToQueue) {
-            const resolve = await client.riffy.resolve({ query: trackQuery, requester: interaction.user.username });
-            if (resolve.tracks.length > 0) {
-                const trackInfo = resolve.tracks[0];
-                player.queue.add(trackInfo);
-                requesters.set(trackInfo.uri, interaction.user.username);
-                queuedTracks++;
-            }
-        }
-
-        if (!player.playing && !player.paused) player.play();
-
-        const randomEmbed = new EmbedBuilder()
-        .setColor(config.embedColor)
-        .setAuthor({
-            name: lang.play.embed.requestUpdated,
-            iconURL: musicIcons.beats2Icon,
-            url: config.SupportServer
-        })
-        .setDescription(lang.play.embed.successProcessed)
-        .setFooter({ text: lang.footer, iconURL: musicIcons.heartIcon });
-    
-        const message = await interaction.followUp({ embeds: [randomEmbed] });
-
-        setTimeout(() => {
-            message.delete().catch(() => {}); 
-        }, 3000);
-        
-    
-
     } catch (error) {
-        console.error('Error processing play command:', error);
-        await interaction.followUp({ content: "❌ An error occurred while processing the request." });
+        console.error('Play command error:', error);
+        await interaction.followUp({
+            content: "❌ An unexpected error occurred. Please try again."
+        });
     }
 }
 
@@ -186,7 +234,7 @@ module.exports = {
     permissions: "0x0000000000000800",
     options: [{
         name: 'name',
-        description: 'Enter song name / link or playlist',
+        description: 'Enter song name/link or playlist',
         type: ApplicationCommandOptionType.String,
         required: true
     }],
